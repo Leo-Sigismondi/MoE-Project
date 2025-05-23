@@ -136,7 +136,7 @@ class MoE(nn.Module):
                 continue
             out_j = expert(feats[idxs])                   # [Nj, embed_dim]
             start, end = j * embed_dim, (j + 1) * embed_dim
-            expert_outs[idxs, start:end] = out_j
+            expert_outs[idxs, start:end] = out_j.to(expert_outs.dtype)
 
         # 5) Final classification
         logits = self.classifier(expert_outs)            # [B, num_classes]
