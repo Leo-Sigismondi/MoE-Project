@@ -51,7 +51,8 @@ class MoE(nn.Module):
 
         # Each expert “scorer” → single logit of confidence
         self.scorers = nn.ModuleList([
-            nn.Linear(trunk_channels, 1) for _ in range(num_experts)
+            nn.Linear(trunk_channels, 1) 
+            for _ in range(num_experts)
         ])
 
         # Each expert’s heavy‐lifting network

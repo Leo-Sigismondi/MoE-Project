@@ -7,7 +7,7 @@ import os
 from Vision_trainer import train_single_model
 from Model import SingleModel
 from Vision_trainer_MoE import train_moe_cnn
-from MoE_2 import MoE
+from MoE_3 import MoE
 
 if __name__ == "__main__":
     # Hyperparameters

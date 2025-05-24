@@ -1,11 +1,8 @@
 import torch
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
 import os
 import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
-from MoE_2 import MoE
 from torch.utils.tensorboard import SummaryWriter
 from metrics import *
 from datetime import datetime
