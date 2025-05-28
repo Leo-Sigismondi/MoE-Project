@@ -6,7 +6,6 @@ from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from metrics import *
 from datetime import datetime
-import time
 
 
 def train_moe_cnn(
@@ -16,9 +15,11 @@ def train_moe_cnn(
     device,
     num_experts=4,
     capacity=128,
-    k=2,
     epochs=20,
+    starting_epoch=0,
+    resume_from_checkpoint=False,
     lr=0.001,
+    run_dir=None,
     log_interval=100,
 ):
     # Model, loss, optimizer
@@ -30,14 +31,20 @@ def train_moe_cnn(
     scaler = torch.GradScaler()
 
     # TensorBoard writer
-    run_name = f"moe_experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    writer = SummaryWriter(f"runs/{run_name}")
+    if run_dir is None:
+        raise ValueError("run_dir must be provided")
+    writer = SummaryWriter(run_dir)
     
     # Training loop
-    print("Starting training...")
+    print("Starting training at:", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
     warmup_epochs = int(epochs * 0.05)
+    k0, k1 = model.k, 2
+    temp0, temp1 = 2.0, 0.3
+
     for epoch in range(epochs):
-        # epoch_start_time = time.time()
+        # If resuming, skip to the specified epoch
+        if resume_from_checkpoint and epoch < starting_epoch:
+            continue
         # Training
         model.train()
         running_loss = 0.0
@@ -55,21 +62,28 @@ def train_moe_cnn(
         mi_sum = 0
         num_batches = 0
 
+        frac = epoch / (epochs - 1)
+        # 1) anneal k
+        k_t = int(round(k0 + (k1 - k0) * frac))
+        model.k = max(1, k_t)
+        # 2) anneal temperature
+        temp_t = temp0 + (temp1 - temp0) * frac
+
         # Dynamic entropy loss weight: negative at start, positive later
         if epoch < warmup_epochs:
-            temp = 1.0
+            # temp = 2.0
             entr_weight = -0.005
         else:
-            temp = 1.0 + (epoch - warmup_epochs) / (epochs - warmup_epochs) * 0.3
+            # temp = 1.0 + (epoch - warmup_epochs) / (epochs - warmup_epochs) * 0.3
             entr_weight = 0.0
 
-        loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False)
+        loop = tqdm(train_loader, desc=f"Training | Epoch {epoch+1}/{epochs}", leave=False)
         for batch_idx, (inputs, targets) in enumerate(loop):
             inputs, targets = inputs.to(device), targets.to(device)
             optimizer.zero_grad()
             with torch.autocast(device_type="cuda"):
                 # Forward pass
-                outputs, scores, D = model(inputs, temp=temp)  # [B, num_classes], [B, num_experts], [B, num_experts]
+                outputs, scores, D = model(inputs, temp=temp_t)  # [B, num_classes], [B, num_experts], [B, num_experts]
 
                 # Compute importance, load, and entropy
                 imp = compute_importance(scores)             # [E]
@@ -87,6 +101,10 @@ def train_moe_cnn(
                 entr_loss = entr_weight * ent  # Negative entropy loss for regularization
                 # Combine losses
                 loss = ce_loss + aux_loss + entr_loss
+                if hasattr(model, "diversity_penalty") and callable(model.diversity_penalty):
+                    penalty = model.diversity_penalty()
+                    if isinstance(penalty, torch.Tensor):
+                        loss = loss + penalty * 0.005
 
             # Backpropagation with mixed precision
             scaler.scale(loss).backward()
@@ -156,7 +174,8 @@ def train_moe_cnn(
         val_correct = 0
         val_total = 0
         with torch.no_grad():
-            for inputs, targets in test_loader:
+            val_loop = tqdm(test_loader, desc=f"Validation | Epoch {epoch+1}/{epochs}", leave=False)
+            for inputs, targets in val_loop:
                 inputs, targets = inputs.to(device), targets.to(device)
                 with torch.autocast("cuda"):
                     outputs, scores, dispatch_mask = model(inputs)
@@ -165,6 +184,7 @@ def train_moe_cnn(
                 _, predicted = outputs.max(1)
                 val_total += targets.size(0)
                 val_correct += predicted.eq(targets).sum().item()
+                val_loop.set_postfix(val_loss=val_loss/val_total if val_total > 0 else 0, val_acc=100.*val_correct/val_total if val_total > 0 else 0)
         val_loss /= val_total
         val_acc = 100. * val_correct / val_total
         # Logging
@@ -182,15 +202,17 @@ def train_moe_cnn(
         
         # Save model checkpoint
         if (epoch + 1) % 10 == 0:
-            checkpoint_dir = f"checkpoints/{run_name}"
+            checkpoint_dir = f"{run_dir}/checkpoints"
             os.makedirs(checkpoint_dir, exist_ok=True)
             torch.save(model.state_dict(), f"{checkpoint_dir}/epoch_{epoch+1}.pth")
-            print(f"Model checkpoint saved at epoch {epoch+1}")
+            # print(f"Model checkpoint saved at epoch {epoch+1}")
     
     writer.close()
-    print("Training complete.")
+    print("Training completed at:", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
 
-    plot_class_expert_heatmap(model, test_loader, device)
-    plot_expert_embedding_pca(model, test_loader, device)
-
-
+    # Save plots in the same folder as the TensorBoard run
+    plot_dir = f"{run_dir}/plots"
+    os.makedirs(plot_dir, exist_ok=True)
+    plot_class_expert_heatmap(model, test_loader, device, save_dir=plot_dir)
+    plot_expert_embedding_pca(model, test_loader, device, save_dir=plot_dir)
+    plot_per_expert_confusion(model, test_loader, device, save_dir=os.path.join(plot_dir, "confusion_matrix"))

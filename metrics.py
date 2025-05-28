@@ -3,6 +3,9 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.decomposition import PCA
+from sklearn.metrics import confusion_matrix
+import numpy as np
+import os
 
 
 def compute_importance(scores):
@@ -120,11 +123,11 @@ def compute_expert_class_mi_top1(scores, targets):
 
 
 
-def plot_class_expert_heatmap(model, dataloader, device, num_classes=10, figsize=(8,6)):
+def plot_class_expert_heatmap(model, dataloader, device, num_classes=10, figsize=(8,6), save_dir="plot", filename="class_expert_heatmap.png"):
     """
     For each true class c and each expert j, computes
     P(sample of class c was assigned to expert j)
-    and plots a heatmap.
+    and saves a heatmap image to the specified folder.
     """
     model.eval()
     E = model.num_experts
@@ -141,31 +144,37 @@ def plot_class_expert_heatmap(model, dataloader, device, num_classes=10, figsize
                 if cls.numel():
                     binc = torch.bincount(cls, minlength=num_classes).float()
                     counts[:, j] += binc
-            # track how many of each class we saw
             class_totals += torch.bincount(y, minlength=num_classes).float()
 
-    # normalize per-class
+    # Avoid division by zero
+    class_totals = class_totals.clamp(min=1e-8)
     probs = (counts / class_totals.unsqueeze(1)).cpu().numpy()
 
+    os.makedirs(save_dir, exist_ok=True)
     plt.figure(figsize=figsize)
-    sns.heatmap(probs, annot=True, fmt=".2f", cmap="viridis",
-                xticklabels=[f"Exp{j}" for j in range(E)],
-                yticklabels=[str(c) for c in range(num_classes)])
+    sns.heatmap(
+        probs,
+        annot=True,
+        fmt=".2f",
+        cmap="hot",  # Changed to a more common color map
+        xticklabels=[f"Exp{j}" for j in range(E)],
+        yticklabels=[str(c) for c in range(num_classes)]
+    )
     plt.xlabel("Expert")
     plt.ylabel("True Class")
     plt.title("P(true class → expert)")
     plt.tight_layout()
-    plt.show()
+    plt.savefig(os.path.join(save_dir, filename))
+    plt.close()
 
-def plot_expert_embedding_pca(model, dataloader, device, samples_per_expert=200, figsize=(8,6)):
+def plot_expert_embedding_pca(model, dataloader, device, samples_per_expert=200, figsize=(8,6), save_dir="plot", filename="expert_embedding_pca.png"):
     """
     Runs val samples through the shared trunk, dispatches to each expert,
     collects up to `samples_per_expert` embeddings per expert,
-    then does a 2D PCA and scatter-plots colored by expert id.
+    then does a 2D PCA and saves a scatter-plot image colored by expert id.
     """
     model.eval()
     E = model.num_experts
-    # C = model.trunk[-1].out_features if hasattr(model.trunk, "__getitem__") else model.trunk[-1]  # not used
     emb_list, owner_list = [], []
 
     with torch.no_grad():
@@ -177,11 +186,10 @@ def plot_expert_embedding_pca(model, dataloader, device, samples_per_expert=200,
             for j in range(E):
                 idx = (D[:, j] > 0.5).nonzero(as_tuple=True)[0]
                 if idx.numel():
-                    idx = idx[:samples_per_expert]        # cap per-expert
-                    emb = model.experts[j](feats[idx])    # [n, embed_dim]
+                    idx = idx[:samples_per_expert]
+                    emb = model.experts[j](feats[idx])
                     emb_list.append(emb.cpu())
                     owner_list.append(torch.full((emb.size(0),), j, dtype=torch.long))
-            # stop once we've got enough
             total = sum(o.numel() for o in owner_list)
             if total >= E * samples_per_expert:
                 break
@@ -189,10 +197,10 @@ def plot_expert_embedding_pca(model, dataloader, device, samples_per_expert=200,
     embs = torch.cat(emb_list, dim=0).numpy()
     owners = torch.cat(owner_list).numpy()
 
-    # PCA to 2D
     pca = PCA(n_components=2)
     proj = pca.fit_transform(embs)
 
+    os.makedirs(save_dir, exist_ok=True)
     plt.figure(figsize=figsize)
     for j in range(E):
         mask = (owners == j)
@@ -202,4 +210,49 @@ def plot_expert_embedding_pca(model, dataloader, device, samples_per_expert=200,
     plt.xlabel("PC1")
     plt.ylabel("PC2")
     plt.tight_layout()
-    plt.show()
+    plt.savefig(os.path.join(save_dir, filename))
+    plt.close()
+
+def plot_per_expert_confusion(model, dataloader, device, num_classes=10, save_dir="conf_mtx"):
+    model.eval()
+    E = model.num_experts
+
+    # store preds & trues per expert
+    preds_per_e = {j: [] for j in range(E)}
+    trues_per_e = {j: [] for j in range(E)}
+
+    with torch.no_grad():
+        for x, y in dataloader:
+            x, y = x.to(device), y.to(device)
+            # get final gated‐ensemble logits and dispatch mask D
+            logits, conf, D = model(x)
+            pred = logits.argmax(dim=1).cpu().numpy()
+            y_cpu = y.cpu().numpy()
+
+            # for each expert, gather samples it handled
+            for j in range(E):
+                idxs = (D[:,j] > 0.5).nonzero(as_tuple=True)[0].cpu().numpy()
+                if len(idxs)==0:
+                    continue
+                preds_per_e[j].append(pred[idxs])
+                trues_per_e[j].append(y_cpu[idxs])
+
+    os.makedirs(save_dir, exist_ok=True)
+    # now plot one confusion matrix per expert
+    for j in range(E):
+        if not preds_per_e[j]:
+            continue
+        preds = np.concatenate(preds_per_e[j])
+        trues = np.concatenate(trues_per_e[j])
+        cm = confusion_matrix(trues, preds, labels=np.arange(num_classes))
+
+        plt.figure(figsize=(5,4))
+        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                    xticklabels=[str(i) for i in range(num_classes)],
+                    yticklabels=[str(i) for i in range(num_classes)])
+        plt.title(f"Expert {j} Confusion Matrix")
+        plt.xlabel("Predicted")
+        plt.ylabel("True")
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, f"expert_{j}_confusion_matrix.png"))
+        plt.close()
