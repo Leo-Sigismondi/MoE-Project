@@ -90,20 +90,20 @@ class MoE(nn.Module):
         # 3) Expert confidence = negative entropy of each expert’s softmax
         probs_e = F.softmax(logits_e, dim=2)              # [B, E, C]
         ent     = -(probs_e * probs_e.clamp(min=1e-12).log()).sum(dim=2)  # [B,E]
-        conf_norm = (-ent) / math.log(self.num_classes)          # [B,E] in [0,1]
+        # conf_norm = (-ent) / math.log(self.num_classes)          # [B,E] in [0,1]
         confidence = -ent 
 
         # 4) learned gate → [B,E]
         gate_logits = self.gate(feats)
-        if self.training:
-            gate_logits = (gate_logits/temp).clamp(-10,10) \
-                        + torch.randn_like(gate_logits)*1e-2
-        gate_probs = F.softmax(gate_logits, dim=1)
+        # if self.training:
+        #     gate_logits = (gate_logits/temp).clamp(-10,10) \
+        #                 + torch.randn_like(gate_logits)*1e-2
+        # gate_probs = F.softmax(gate_logits, dim=1)
 
         # 5) combine on equal footing
         alpha = 1.0 
         # routing_scores = alpha * gate_probs + (1 - alpha) * confidence
-        routing_scores = gate_probs * conf_norm
+        routing_scores = gate_logits * confidence
 
         # 6) Vectorized per-expert top-C routing
         C_eff = min(C, B)

@@ -3,7 +3,7 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.decomposition import PCA
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import numpy as np
 import os
 
@@ -137,9 +137,10 @@ def plot_class_expert_heatmap(model, dataloader, device, num_classes=10, figsize
     with torch.no_grad():
         for x, y in dataloader:
             x, y = x.to(device), y.to(device)
-            _, _, D = model(x)              # D: [B, E] dispatch mask
+            # Use assignment mask from model with return_aux=True
+            _, _, assignment, *_ = model(x, return_aux=True, targets=y)  # assignment: [B, E]
             for j in range(E):
-                idx = (D[:, j] > 0.5).nonzero(as_tuple=True)[0]
+                idx = (assignment[:, j] > 0.5).nonzero(as_tuple=True)[0]
                 cls = y[idx]
                 if cls.numel():
                     binc = torch.bincount(cls, minlength=num_classes).float()
@@ -156,7 +157,7 @@ def plot_class_expert_heatmap(model, dataloader, device, num_classes=10, figsize
         probs,
         annot=True,
         fmt=".2f",
-        cmap="hot",  # Changed to a more common color map
+        cmap="plasma",
         xticklabels=[f"Exp{j}" for j in range(E)],
         yticklabels=[str(c) for c in range(num_classes)]
     )
@@ -167,92 +168,175 @@ def plot_class_expert_heatmap(model, dataloader, device, num_classes=10, figsize
     plt.savefig(os.path.join(save_dir, filename))
     plt.close()
 
-def plot_expert_embedding_pca(model, dataloader, device, samples_per_expert=200, figsize=(8,6), save_dir="plot", filename="expert_embedding_pca.png"):
-    """
-    Runs val samples through the shared trunk, dispatches to each expert,
-    collects up to `samples_per_expert` embeddings per expert,
-    then does a 2D PCA and saves a scatter-plot image colored by expert id.
-    """
+# def plot_expert_embedding_pca(model, dataloader, device, samples_per_expert=200, figsize=(8,6), save_dir="plot", filename="expert_embedding_pca.png"):
+#     """
+#     Runs val samples through the shared trunk, dispatches to each expert,
+#     collects up to `samples_per_expert` embeddings per expert,
+#     then does a 2D PCA and saves a scatter-plot image colored by expert id.
+#     """
+#     model.eval()
+#     E = model.num_experts
+#     emb_list, owner_list = [], []
+
+#     with torch.no_grad():
+#         for x, _ in dataloader:
+#             x = x.to(device)
+#             feats = model.trunk(x)          # [B, feat_dim]
+#             _, _, D = model(x)              # dispatch mask [B, E]
+
+#             for j in range(E):
+#                 idx = (D[:, j] > 0.5).nonzero(as_tuple=True)[0]
+#                 if idx.numel():
+#                     idx = idx[:samples_per_expert]
+#                     emb = model.experts[j](feats[idx])
+#                     emb_list.append(emb.cpu())
+#                     owner_list.append(torch.full((emb.size(0),), j, dtype=torch.long))
+#             total = sum(o.numel() for o in owner_list)
+#             if total >= E * samples_per_expert:
+#                 break
+
+#     embs = torch.cat(emb_list, dim=0).numpy()
+#     owners = torch.cat(owner_list).numpy()
+
+#     pca = PCA(n_components=2)
+#     proj = pca.fit_transform(embs)
+
+#     os.makedirs(save_dir, exist_ok=True)
+#     plt.figure(figsize=figsize)
+#     for j in range(E):
+#         mask = (owners == j)
+#         plt.scatter(proj[mask, 0], proj[mask, 1], label=f"Expert {j}", alpha=0.6)
+#     plt.legend()
+#     plt.title("PCA of Expert Embeddings")
+#     plt.xlabel("PC1")
+#     plt.ylabel("PC2")
+#     plt.tight_layout()
+#     plt.savefig(os.path.join(save_dir, filename))
+#     plt.close()
+
+# def plot_per_expert_confusion(model, dataloader, device, num_classes=10, save_dir="conf_mtx"):
+#     model.eval()
+#     E = model.num_experts
+
+#     # store preds & trues per expert
+#     preds_per_e = {j: [] for j in range(E)}
+#     trues_per_e = {j: [] for j in range(E)}
+
+#     with torch.no_grad():
+#         for x, y in dataloader:
+#             x, y = x.to(device), y.to(device)
+#             # get final gated‐ensemble logits and dispatch mask D
+#             logits, _, D, *_ = model(x)
+#             pred = logits.argmax(dim=1).cpu().numpy()
+#             y_cpu = y.cpu().numpy()
+ 
+#             # for each expert, gather samples it handled
+#             for j in range(E):
+#                 idxs = (D[:,j] > 0.5).nonzero(as_tuple=True)[0].cpu().numpy()
+#                 if len(idxs)==0:
+#                     continue
+#                 preds_per_e[j].append(pred[idxs])
+#                 trues_per_e[j].append(y_cpu[idxs])
+
+#     os.makedirs(save_dir, exist_ok=True)
+#     # now plot one confusion matrix per expert
+#     for j in range(E):
+#         if not preds_per_e[j]:
+#             continue
+#         preds = np.concatenate(preds_per_e[j])
+#         trues = np.concatenate(trues_per_e[j])
+#         cm = confusion_matrix(trues, preds, labels=np.arange(num_classes))
+
+#         plt.figure(figsize=(5,4))
+#         sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+#                     xticklabels=[str(i) for i in range(num_classes)],
+#                     yticklabels=[str(i) for i in range(num_classes)])
+#         plt.title(f"Expert {j} Confusion Matrix")
+#         plt.xlabel("Predicted")
+#         plt.ylabel("True")
+#         plt.tight_layout()
+#         plt.savefig(os.path.join(save_dir, f"expert_{j}_confusion_matrix.png"))
+#         plt.close()
+
+
+
+def plot_per_expert_confusion(model, dataloader, device, num_classes=10, save_dir="plots/confusion_matrix"):
     model.eval()
-    E = model.num_experts
-    emb_list, owner_list = [], []
+    os.makedirs(save_dir, exist_ok=True)
+    all_preds = []
+    all_labels = []
+    all_experts = []
 
     with torch.no_grad():
-        for x, _ in dataloader:
-            x = x.to(device)
-            feats = model.trunk(x)          # [B, feat_dim]
-            _, _, D = model(x)              # dispatch mask [B, E]
+        for images, labels in dataloader:
+            images = images.to(device)
+            labels = labels.to(device)
+            logits, probs, assignment, *_ = model(images, return_aux=True, targets=labels)
+            preds = logits.argmax(dim=1)
+            # assignment: [B, num_experts], bool
+            # For each sample, find which expert was assigned (should be only one True per row)
+            expert_ids = assignment.float().argmax(dim=1)
+            all_preds.append(preds.cpu())
+            all_labels.append(labels.cpu())
+            all_experts.append(expert_ids.cpu())
 
-            for j in range(E):
-                idx = (D[:, j] > 0.5).nonzero(as_tuple=True)[0]
-                if idx.numel():
-                    idx = idx[:samples_per_expert]
-                    emb = model.experts[j](feats[idx])
-                    emb_list.append(emb.cpu())
-                    owner_list.append(torch.full((emb.size(0),), j, dtype=torch.long))
-            total = sum(o.numel() for o in owner_list)
-            if total >= E * samples_per_expert:
-                break
+    all_preds = torch.cat(all_preds)
+    all_labels = torch.cat(all_labels)
+    all_experts = torch.cat(all_experts)
 
-    embs = torch.cat(emb_list, dim=0).numpy()
-    owners = torch.cat(owner_list).numpy()
+    for expert_id in range(model.num_experts):
+        idx = (all_experts == expert_id)
+        if idx.sum() == 0:
+            continue
+        cm = confusion_matrix(all_labels[idx], all_preds[idx], labels=range(num_classes))
+        disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=range(num_classes))
+        disp.plot(cmap='Blues', xticks_rotation='vertical')
+        plt.title(f"Confusion Matrix for Expert {expert_id}")
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, f"confusion_matrix_expert_{expert_id}.png"))
+        plt.close()
+
+def plot_expert_embedding_pca(model, dataloader, device, save_dir="plots/expert_embeddings", filename="expert_embeddings_pca.png", figsize=(10, 10)):
+    model.eval()
+    os.makedirs(save_dir, exist_ok=True)
+    embeddings = []
+    experts = []
+    labels = []
+
+    with torch.no_grad():
+        for images, lbls in dataloader:
+            images = images.to(device)
+            lbls = lbls.to(device)
+            # Get shared features from the trunk
+            shared_features = model.encoder(images)  # (B, c2, H, W)
+            flat_features = shared_features.mean(dim=(-2, -1))  # (B, c2)
+            logits, probs, assignment, *_ = model(images, return_aux=True, targets=lbls)
+            expert_ids = assignment.float().argmax(dim=1)
+            for i in range(images.size(0)):
+                expert_idx = expert_ids[i].item()
+                expert = model.experts[expert_idx]
+                # Pass the shared features for this sample to the expert's encoder/project
+                expert_input = shared_features[i:i+1]
+                emb = expert.encoder(expert_input)
+                emb = expert.project(emb)
+                emb = emb.cpu().squeeze(0)
+                embeddings.append(emb)
+                experts.append(expert_idx)
+                labels.append(lbls[i].item())
+
+    embeddings = torch.stack(embeddings).numpy()
+    experts = np.array(experts)
+    labels = np.array(labels)
 
     pca = PCA(n_components=2)
-    proj = pca.fit_transform(embs)
+    reduced = pca.fit_transform(embeddings)
 
-    os.makedirs(save_dir, exist_ok=True)
     plt.figure(figsize=figsize)
-    for j in range(E):
-        mask = (owners == j)
-        plt.scatter(proj[mask, 0], proj[mask, 1], label=f"Expert {j}", alpha=0.6)
-    plt.legend()
-    plt.title("PCA of Expert Embeddings")
-    plt.xlabel("PC1")
-    plt.ylabel("PC2")
+    scatter = plt.scatter(reduced[:, 0], reduced[:, 1], c=experts, cmap='tab10', alpha=0.6, s=10)
+    plt.legend(*scatter.legend_elements(), title="Expert")
+    plt.title("Expert Embeddings PCA")
+    plt.xlabel("PCA 1")
+    plt.ylabel("PCA 2")
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, filename))
     plt.close()
-
-def plot_per_expert_confusion(model, dataloader, device, num_classes=10, save_dir="conf_mtx"):
-    model.eval()
-    E = model.num_experts
-
-    # store preds & trues per expert
-    preds_per_e = {j: [] for j in range(E)}
-    trues_per_e = {j: [] for j in range(E)}
-
-    with torch.no_grad():
-        for x, y in dataloader:
-            x, y = x.to(device), y.to(device)
-            # get final gated‐ensemble logits and dispatch mask D
-            logits, conf, D = model(x)
-            pred = logits.argmax(dim=1).cpu().numpy()
-            y_cpu = y.cpu().numpy()
-
-            # for each expert, gather samples it handled
-            for j in range(E):
-                idxs = (D[:,j] > 0.5).nonzero(as_tuple=True)[0].cpu().numpy()
-                if len(idxs)==0:
-                    continue
-                preds_per_e[j].append(pred[idxs])
-                trues_per_e[j].append(y_cpu[idxs])
-
-    os.makedirs(save_dir, exist_ok=True)
-    # now plot one confusion matrix per expert
-    for j in range(E):
-        if not preds_per_e[j]:
-            continue
-        preds = np.concatenate(preds_per_e[j])
-        trues = np.concatenate(trues_per_e[j])
-        cm = confusion_matrix(trues, preds, labels=np.arange(num_classes))
-
-        plt.figure(figsize=(5,4))
-        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
-                    xticklabels=[str(i) for i in range(num_classes)],
-                    yticklabels=[str(i) for i in range(num_classes)])
-        plt.title(f"Expert {j} Confusion Matrix")
-        plt.xlabel("Predicted")
-        plt.ylabel("True")
-        plt.tight_layout()
-        plt.savefig(os.path.join(save_dir, f"expert_{j}_confusion_matrix.png"))
-        plt.close()

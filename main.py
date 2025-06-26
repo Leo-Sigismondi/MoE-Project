@@ -6,8 +6,9 @@ from metrics import *
 
 from Vision_trainer import train_single_model
 from Model import SingleModel
+from Waterfall_trainer import train_moe_waterfall
 from Vision_trainer_MoE import train_moe_cnn
-from MoE_5 import MoE
+from MoE_7 import MoE
 import json
 from datetime import datetime
 
@@ -26,7 +27,7 @@ if __name__ == "__main__":
     # Hyperparameters
     batch_size = 256
     num_experts = 8
-    capacity = 64
+    capacity = 24
     k = 4
     epochs = 150
     lr = 0.001
@@ -68,7 +69,7 @@ if __name__ == "__main__":
             print(f"Resuming from checkpoint: {checkpoint_path}")
             model.load_state_dict(torch.load(checkpoint_path, map_location=device))
         # Train MoE model
-        train_moe_cnn(
+        train_moe_waterfall(
             model=model,
             train_loader=train_loader,
             test_loader=test_loader,
