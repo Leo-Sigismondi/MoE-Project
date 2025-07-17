@@ -78,17 +78,16 @@ class SingleImprovedModel(nn.Module):
                 nn.MaxPool2d(2, 2),  # 16→8
                 nn.Dropout2d(0.1),
                 # Block 3
-                nn.Conv2d(128, 256, 3, padding=1), 
-                nn.BatchNorm2d(256), 
+                nn.Conv2d(128, trunk_channels, 3, padding=1), 
+                nn.BatchNorm2d(trunk_channels), 
                 nn.ReLU(inplace=True),
-                nn.Conv2d(256, 256, 3, padding=1), 
-                nn.BatchNorm2d(256), 
+                nn.Conv2d(trunk_channels, trunk_channels, 3, padding=1), 
+                nn.BatchNorm2d(trunk_channels), 
                 nn.ReLU(inplace=True),
                 nn.AdaptiveAvgPool2d(1),
                 nn.Flatten(),
                 nn.Dropout(0.2),
             )
-            trunk_channels = 256
         else:
             self.trunk = trunk
 

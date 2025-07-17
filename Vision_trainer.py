@@ -1,3 +1,4 @@
+import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -5,6 +6,7 @@ from torch.cuda.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from datetime import datetime
+from pathlib import Path
 
 def train_single_model(
     model,
@@ -22,8 +24,22 @@ def train_single_model(
     scaler = torch.GradScaler()
 
     # TensorBoard writer
-    run_name = f"CNN_experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    writer = SummaryWriter(f"runs/{run_name}")
+    run_name = f"runs/CNN_experiment_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    writer = SummaryWriter(f"{run_name}")
+    
+    # Log file
+    run_dir = Path(run_name)
+    log_txt = run_dir / "train_log.txt"
+
+    if not log_txt.exists():
+        with log_txt.open("w") as fp:
+            json.dump({
+                "model": model.__class__.__name__,
+                "epochs": epochs,
+                "lr": lr,
+                "use_amp": use_amp,
+            }, fp)
+            fp.write("\n")
 
     for epoch in range(epochs):
         model.train()
@@ -86,5 +102,15 @@ def train_single_model(
         writer.add_scalar('Accuracy/Train', train_acc, epoch)
         writer.add_scalar('Loss/Validation', val_loss, epoch)
         writer.add_scalar('Accuracy/Validation', val_acc, epoch)
+
+        # txt log
+        log_line = (
+            f"{epoch + 1:03d} | "
+            f"train_loss {train_loss:.4f} acc {train_acc:.2f}% | "
+            f"val_loss {val_loss:.4f} acc {val_acc:.2f}% | "
+        )
+        print(log_line)
+        with log_txt.open("a") as fp:
+            fp.write(log_line + "\n")
 
         # print(f"Epoch {epoch+1}: Train Loss {train_loss:.4f}, Train Acc {train_acc:.2f}%, Val Loss {val_loss:.4f}, Val Acc {val_acc:.2f}%")

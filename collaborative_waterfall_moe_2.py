@@ -5,20 +5,44 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# --- Optional: Expert orthogonality loss ---
+# # --- Optional: Expert orthogonality loss ---
+# def orthogonality_loss(z_experts: List[torch.Tensor]) -> torch.Tensor:
+#     loss = 0.0
+#     num = 0
+#     for i in range(len(z_experts)):
+#         for j in range(i + 1, len(z_experts)):
+#             if z_experts[i].size(0) == 0 or z_experts[j].size(0) == 0:
+#                 continue
+#             zi = F.normalize(z_experts[i], dim=1)
+#             zj = F.normalize(z_experts[j], dim=1)
+#             sim = torch.mm(zi, zj.T).pow(2).mean()
+#             loss += sim
+#             num += 1
+#     return loss / max(num, 1)
+
 def orthogonality_loss(z_experts: List[torch.Tensor]) -> torch.Tensor:
-    loss = 0.0
-    num = 0
+    """
+    Encourages all experts' embeddings to be as orthogonal as possible.
+    For each expert, computes the max squared cosine similarity with all others,
+    then averages these maxima across experts.
+    """
+    per_expert_max_sims = []
     for i in range(len(z_experts)):
-        for j in range(i + 1, len(z_experts)):
-            if z_experts[i].size(0) == 0 or z_experts[j].size(0) == 0:
+        if z_experts[i].size(0) == 0:
+            continue
+        zi = F.normalize(z_experts[i], dim=1)
+        max_sim = 0.0
+        for j in range(len(z_experts)):
+            if i == j or z_experts[j].size(0) == 0:
                 continue
-            zi = F.normalize(z_experts[i], dim=1)
             zj = F.normalize(z_experts[j], dim=1)
-            sim = torch.mm(zi, zj.T).pow(2).mean()
-            loss += sim
-            num += 1
-    return loss / max(num, 1)
+            sim = torch.mm(zi, zj.T).pow(2).mean().item()
+            max_sim = max(max_sim, sim)
+        per_expert_max_sims.append(max_sim)
+    if len(per_expert_max_sims) == 0:
+        return torch.tensor(0.0, device=z_experts[0].device if len(z_experts) > 0 else "cpu")
+    return torch.tensor(per_expert_max_sims, device=z_experts[0].device).mean()
+
 
 # --- SlimExpert with scorer and class head sharing the same sub-features ---
 class SlimExpert(nn.Module):
@@ -38,6 +62,9 @@ class SlimExpert(nn.Module):
             nn.Conv2d(c2, c3, 3, padding=1),
             nn.BatchNorm2d(c3),
             nn.ReLU(inplace=True),
+            # nn.Conv2d(c3, c3, 3, padding=1),
+            # nn.BatchNorm2d(c3),
+            # nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
             nn.Dropout(0.2),
@@ -75,13 +102,12 @@ class CollaborativeWaterfallMoE(nn.Module):
         num_experts: int = 4,
         capacity: int | str = "auto",
         in_channels: int = 3,
-        hidden_channels: Tuple[int, int, int] = (64, 128, 256),
+        hidden_channels: Tuple[int, int, int] = (64, 128, 32),
         embed_dim: int = 256,
         num_classes: int = 10,
-        balance_loss_weight: float = 0.0,
         scorer_aux_loss_weight: float = 0.1,
         orthogonality_weight: float = 0.1,
-        class_entropy_weight: float = 0.5,
+        class_entropy_weight: float = 0.1,
         diversity_weight: float = 0.1,
         scorer_hidden: int = 128,
     ):
@@ -106,9 +132,9 @@ class CollaborativeWaterfallMoE(nn.Module):
             nn.Conv2d(c1, c2, 3, padding=1),
             nn.BatchNorm2d(c2),
             nn.ReLU(inplace=True),
-            nn.Conv2d(c2, c2, 3, padding=1),
-            nn.BatchNorm2d(c2),
-            nn.ReLU(inplace=True),
+            # nn.Conv2d(c2, c2, 3, padding=1),
+            # nn.BatchNorm2d(c2),
+            # nn.ReLU(inplace=True),
             nn.MaxPool2d(2, 2),
             nn.Dropout2d(0.1),
         )
@@ -125,11 +151,39 @@ class CollaborativeWaterfallMoE(nn.Module):
         ])
 
         # Loss weights
-        self.balance_loss_weight = balance_loss_weight
         self.scorer_aux_loss_weight = scorer_aux_loss_weight
         self.orthogonality_weight = orthogonality_weight
         self.class_entropy_weight = class_entropy_weight
         self.diversity_weight = diversity_weight
+
+        self._init_weights()  # <-- Add this line to call initialization
+
+    def _init_weights(self):
+        # Initialize shared encoder
+        for m in self.encoder.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.zeros_(m.bias)
+        # Initialize experts
+        for expert in self.experts:
+            for m in expert.modules():
+                if isinstance(m, nn.Conv2d):
+                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+                elif isinstance(m, nn.BatchNorm2d):
+                    nn.init.ones_(m.weight)
+                    nn.init.zeros_(m.bias)
+                elif isinstance(m, nn.Linear):
+                    nn.init.xavier_normal_(m.weight)
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x, T=0.1, return_aux=False, targets=None):
         B = x.size(0)
@@ -257,42 +311,3 @@ class CollaborativeWaterfallMoE(nn.Module):
         if return_aux:
             return out_logits, probs, assignment, aux_loss, iter_, scores, aux_losses
         return out_logits
-
-# --- Usage Example / Test ---
-if __name__ == "__main__":
-    torch.manual_seed(42)
-    model = CollaborativeWaterfallMoE(
-        num_experts=4,
-        num_classes=10,
-        scorer_aux_loss_weight=0.05,
-        class_entropy_weight=0.01,
-        diversity_weight=0.01,
-    ).cuda()
-    optim = torch.optim.Adam(model.parameters(), lr=3e-4)
-    criterion = nn.CrossEntropyLoss()
-
-    B = 64
-    dummy_x = torch.randn(B, 3, 32, 32).cuda()
-    dummy_y = torch.randint(0, 10, (B,), dtype=torch.long).cuda()
-
-    model.train()
-    for step in range(5):
-        logits, probs, assignment, aux_loss, iter_, scores, aux_losses = model(
-            dummy_x, return_aux=True, targets=dummy_y
-        )
-        loss = criterion(logits, dummy_y)
-        if aux_loss is not None:
-            loss = loss + aux_loss
-        optim.zero_grad()
-        loss.backward()
-        optim.step()
-
-        print(f"step {step}: loss={loss.item():.3f} | aux={aux_loss.item() if aux_loss else 0:.3f} | iters={iter_}")
-        print(f"  expert usage: {assignment.sum(dim=0).tolist()}")
-
-    # Eval test
-    model.eval()
-    with torch.no_grad():
-        eval_logits = model(dummy_x, return_aux=True, targets=dummy_y)
-        print(f"Eval mode output: {eval_logits[0].shape}")
-

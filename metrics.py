@@ -6,6 +6,8 @@ from sklearn.decomposition import PCA
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import numpy as np
 import os
+from mpl_toolkits.mplot3d import Axes3D  # Add this import at the top if not present
+
 
 
 def compute_importance(scores):
@@ -157,7 +159,7 @@ def plot_class_expert_heatmap(model, dataloader, device, num_classes=10, figsize
         probs,
         annot=True,
         fmt=".2f",
-        cmap="plasma",
+        cmap="viridis",
         xticklabels=[f"Exp{j}" for j in range(E)],
         yticklabels=[str(c) for c in range(num_classes)]
     )
@@ -332,11 +334,59 @@ def plot_expert_embedding_pca(model, dataloader, device, save_dir="plots/expert_
     reduced = pca.fit_transform(embeddings)
 
     plt.figure(figsize=figsize)
-    scatter = plt.scatter(reduced[:, 0], reduced[:, 1], c=experts, cmap='tab10', alpha=0.6, s=10)
+    scatter = plt.scatter(reduced[:, 0], reduced[:, 1], c=experts, cmap='tab10', alpha=1, s=10)
     plt.legend(*scatter.legend_elements(), title="Expert")
     plt.title("Expert Embeddings PCA")
     plt.xlabel("PCA 1")
     plt.ylabel("PCA 2")
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, filename))
+    plt.close()
+
+
+
+def plot_expert_embedding_pca_3d(model, dataloader, device, save_dir="plots/expert_embeddings", filename="expert_embeddings_pca_3d.png", figsize=(10, 10)):
+    model.eval()
+    os.makedirs(save_dir, exist_ok=True)
+    embeddings = []
+    experts = []
+    labels = []
+
+    with torch.no_grad():
+        for images, lbls in dataloader:
+            images = images.to(device)
+            lbls = lbls.to(device)
+            shared_features = model.encoder(images)  # (B, c2, H, W)
+            logits, probs, assignment, *_ = model(images, return_aux=True, targets=lbls)
+            expert_ids = assignment.float().argmax(dim=1)
+            for i in range(images.size(0)):
+                expert_idx = expert_ids[i].item()
+                expert = model.experts[expert_idx]
+                expert_input = shared_features[i:i+1]
+                emb = expert.encoder(expert_input)
+                emb = expert.project(emb)
+                emb = emb.cpu().squeeze(0)
+                embeddings.append(emb)
+                experts.append(expert_idx)
+                labels.append(lbls[i].item())
+
+    embeddings = torch.stack(embeddings).numpy()
+    experts = np.array(experts)
+    labels = np.array(labels)
+
+    pca = PCA(n_components=3)
+    reduced = pca.fit_transform(embeddings)
+
+    fig = plt.figure(figsize=figsize)
+    ax = fig.add_subplot(111, projection='3d')
+    scatter = ax.scatter(reduced[:, 0], reduced[:, 1], reduced[:, 2], c=experts, cmap='tab10', alpha=1, s=10)
+    legend = ax.legend(*scatter.legend_elements(), title="Expert", loc="upper right")
+    ax.add_artist(legend)
+    ax.set_title("Expert Embeddings PCA (3D)")
+    ax.set_xlabel("PCA 1")
+    ax.set_ylabel("PCA 2")
+    ax.set_zlabel("PCA 3")
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, filename))
+    plt.show()
     plt.close()

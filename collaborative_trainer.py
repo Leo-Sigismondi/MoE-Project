@@ -230,8 +230,6 @@ def train_moe_waterfall(
                 images, targets = images.to(device, non_blocking=True), targets.to(device, non_blocking=True)
                 logits, probs, assignment, aux_loss, iters, scores, aux_losses = model(images, T=0.1, return_aux=True, targets=targets)
                 loss = criterion(logits, targets)
-                if aux_loss is not None:
-                    loss = loss + aux_loss
 
                 bs = targets.size(0)
                 ep_val_loss += loss.item() * bs
@@ -242,12 +240,6 @@ def train_moe_waterfall(
                 batch_entropy = -(probs * probs.clamp_min(1e-9).log()).sum(dim=1).mean().item()
                 val_entropies.append(batch_entropy)
                 val_iter_counts.append(iters)
-
-                # --- Log aux_losses components (val) ---
-                if isinstance(aux_losses, dict):
-                    for k, v in aux_losses.items():
-                        if hasattr(v, "item"):
-                            writer.add_scalar(f"AuxLosses/val/{k}", v.item(), epoch)
 
         ep_val_loss /= n_val
         ep_val_acc /= n_val
