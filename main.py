@@ -8,8 +8,8 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
 from metrics import *
-from Vision_trainer import train_single_model
-from Model import SingleImprovedModel
+from SingleModel_trainer import train_single_model
+from SingleModels import SingleImprovedModel
 from collaborative_waterfall_moe import CollaborativeWaterfallMoE
 from collaborative_trainer import train_moe_waterfall
 
