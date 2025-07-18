@@ -1,27 +1,3 @@
-# collaborative_waterfall_moe.py
-"""
-Collaborative Waterfall Mixture‑of‑Experts
------------------------------------------
-A PyTorch implementation of the routing strategy discussed on 18 Jun 2025.
-Key points
-*  Each expert scores every token with an internal, *cheap* scorer head.
-*  Tokens are assigned to experts with an **iterative waterfall** respecting a
-   per‑expert capacity `C`.
-*  After routing, the **expensive encoder** of each expert is run **only on the
-   tokens that were actually assigned** → conditional compute & FLOP savings.
-*  A simple per‑expert classification head emits logits that are stitched back
-   together to obtain the final batch output.
-
-The module exposes two main classes:
-    • ``SlimExpert``                 – a lightweight per‑expert module
-    • ``CollaborativeWaterfallMoE``  – the MoE container implementing routing
-
-This file is **self‑contained**: run it to see a minimal training loop on dummy
-CIFAR‑like data.
-"""
-
-from __future__ import annotations
-
 import math
 from typing import List, Tuple
 
@@ -29,73 +5,60 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ---------------------------------------------------------------------------
-# Helper blocks
-# ---------------------------------------------------------------------------
+# # --- Optional: Expert orthogonality loss ---
+# def orthogonality_loss(z_experts: List[torch.Tensor]) -> torch.Tensor:
+#     loss = 0.0
+#     num = 0
+#     for i in range(len(z_experts)):
+#         for j in range(i + 1, len(z_experts)):
+#             if z_experts[i].size(0) == 0 or z_experts[j].size(0) == 0:
+#                 continue
+#             zi = F.normalize(z_experts[i], dim=1)
+#             zj = F.normalize(z_experts[j], dim=1)
+#             sim = torch.mm(zi, zj.T).pow(2).mean()
+#             loss += sim
+#             num += 1
+#     return loss / max(num, 1)
 
-
-def conv_bn_relu(in_ch: int, out_ch: int, k: int = 3, s: int = 1, p: int | None = None) -> nn.Sequential:
-    """Tiny helper: conv → batchnorm → ReLU."""
-    if p is None:
-        p = k // 2
-    return nn.Sequential(
-        nn.Conv2d(in_ch, out_ch, k, s, p, bias=False),
-        nn.BatchNorm2d(out_ch),
-        nn.ReLU(inplace=True),
-        nn.Dropout2d(0.1),
-    )
-
-
-class GlobalAvgPool(nn.Module):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # B × C × H × W → B × C
-        return torch.mean(x, dim=(-2, -1))
-
-
-# ---------------------------------------------------------------------------
-#     Slim Expert (feature extractor  +  scorer  +  classifier)
-# ---------------------------------------------------------------------------
-
-class SlimExpert(nn.Module):
-    """A *very* lightweight expert with internal scorer.
-
-    The scorer head is deliberately small so that computing scores on the full
-    batch is cheap. The heavy encode+classify path is conditionally executed
-    only on the routed subset.
+def orthogonality_loss(z_experts: List[torch.Tensor]) -> torch.Tensor:
     """
+    Encourages all experts' embeddings to be as orthogonal as possible.
+    For each expert, computes the max squared cosine similarity with all others,
+    then averages these maxima across experts.
+    """
+    per_expert_max_sims = []
+    for i in range(len(z_experts)):
+        if z_experts[i].size(0) == 0:
+            continue
+        zi = F.normalize(z_experts[i], dim=1)
+        max_sim = 0.0
+        for j in range(len(z_experts)):
+            if i == j or z_experts[j].size(0) == 0:
+                continue
+            zj = F.normalize(z_experts[j], dim=1)
+            sim = torch.mm(zi, zj.T).pow(2).mean().item()
+            max_sim = max(max_sim, sim)
+        per_expert_max_sims.append(max_sim)
+    if len(per_expert_max_sims) == 0:
+        return torch.tensor(0.0, device=z_experts[0].device if len(z_experts) > 0 else "cpu")
+    return torch.tensor(per_expert_max_sims, device=z_experts[0].device).mean()
 
+
+# --- SlimExpert with scorer and class head sharing the same sub-features ---
+class SlimExpert(nn.Module):
     def __init__(
         self,
-        in_channels: int = 3,
-        hidden_channels: List[int] | Tuple[int, ...] = (64, 128, 256),
-        embed_dim: int = 256,
-        num_classes: int = 10,
-    ) -> None:
+        in_channels: int,
+        hidden_channels: Tuple[int, int, int],
+        embed_dim: int,
+        num_classes: int,
+        scorer_hidden: int = 128,
+    ):
         super().__init__()
+        _, c2, c3 = hidden_channels
 
-        c1, c2, c3 = hidden_channels
-
-        self.encoder = nn.Sequential( 
-            # Block 1
-            nn.Conv2d(in_channels, c1, 3, padding=1),
-            nn.BatchNorm2d(c1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(c1, c1, 3, padding=1),
-            nn.BatchNorm2d(c1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),  # 32→16
-            nn.Dropout2d(0.1),
-            
-            # Block 2
-            nn.Conv2d(c1, c2, 3, padding=1),
-            nn.BatchNorm2d(c2),
-            nn.ReLU(inplace=True),
-            # nn.Conv2d(c2, c2, 3, padding=1),
-            # nn.BatchNorm2d(c2),
-            # nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),  # 16→8
-            nn.Dropout2d(0.1),
-            
-            # Block 3
+        # Classifier head: operates on expert's own conv block
+        self.encoder = nn.Sequential(
             nn.Conv2d(c2, c3, 3, padding=1),
             nn.BatchNorm2d(c3),
             nn.ReLU(inplace=True),
@@ -105,197 +68,248 @@ class SlimExpert(nn.Module):
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
             nn.Dropout(0.2),
-        )  # B×C
-
-        self.project = nn.Linear(c3, embed_dim)
+        )
+        self.project = nn.Sequential(
+            nn.Linear(c3, embed_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+        )
         self.classifier = nn.Linear(embed_dim, num_classes)
 
-        # ----- scorer head (cheap) -------------------------------------------------
-        self.scorer = nn.Sequential(
-            nn.Conv2d(in_channels, 4, kernel_size=1),  # 1×1 conv → 4ch
-            nn.ReLU(inplace=True),
-            GlobalAvgPool(),
-            nn.Linear(4, 1),  # scalar logit
-        )
+        # Scorer/class specialization head: takes shared features, projects, splits
+        self.scorer_project = nn.Linear(c2, scorer_hidden)
+        self.scorer_head = nn.Linear(scorer_hidden, 1)
+        self.class_head = nn.Linear(scorer_hidden, num_classes)
 
-    # ---------------------------------------------------------------------
-    # Public API
-    # ---------------------------------------------------------------------
-    @torch.no_grad()
-    def score_tokens(self, x: torch.Tensor) -> torch.Tensor:  # B × 1
-        """Cheap preference logit for each token."""
-        return self.scorer(x).squeeze(-1)  # (B)
+    def score_tokens(self, features):  # features: (B, c2)
+        h = self.scorer_project(features)
+        return self.scorer_head(h).squeeze(-1)  # (B,)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # B × C × H × W
-        """Full path: encode + classify."""
-        z = self.encoder(x)               # B × C
-        z = self.project(z)               # B × D
-        logits = self.classifier(z)       # B × classes
+    def predict_class(self, features):
+        h = self.scorer_project(features)
+        return self.class_head(h)  # (B, num_classes)
+
+    def forward(self, x):  # x: (B, c2, H, W)
+        feats = self.encoder(x)
+        z = self.project(feats)
+        logits = self.classifier(z)
         return logits
 
-
-# ---------------------------------------------------------------------------
-#              Collaborative Waterfall Routing MoE
-# ---------------------------------------------------------------------------
-
+# --- CollaborativeWaterfallMoE ---
 class CollaborativeWaterfallMoE(nn.Module):
-    """Mixture‑of‑Experts with progressive waterfall routing.
-
-    Parameters
-    ----------
-    num_experts : int
-        Number of *SlimExpert* modules.
-    capacity : int  | "auto"
-        Maximum number of tokens an expert can take.
-        If "auto", capacity = ceil(B / num_experts).
-    balance_loss_weight : float, optional
-        Strength of load‑balance loss added during training.
-    """
-
     def __init__(
         self,
         num_experts: int = 4,
         capacity: int | str = "auto",
         in_channels: int = 3,
+        hidden_channels: Tuple[int, int, int] = (64, 128, 32),
+        embed_dim: int = 256,
         num_classes: int = 10,
-        balance_loss_weight: float = 0.1,
-    ) -> None:
+        scorer_aux_loss_weight: float = 0.1,
+        orthogonality_weight: float = 0.1,
+        class_entropy_weight: float = 0.1,
+        diversity_weight: float = 0.1,
+        scorer_hidden: int = 128,
+    ):
         super().__init__()
         self.num_experts = num_experts
         self.in_channels = in_channels
         self.num_classes = num_classes
-        self.balance_loss_weight = balance_loss_weight
-        self.experts = nn.ModuleList([
-            SlimExpert(in_channels, num_classes=num_classes) for _ in range(num_experts)
-        ])
-        # capacity will be resolved at runtime if set to "auto"
         self._static_capacity = capacity if capacity != "auto" else None
 
-    # ---------------------------------------------------------------------
-    # Forward
-    # ---------------------------------------------------------------------
+        # Shared trunk
+        c1, c2, _ = hidden_channels
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, c1, 3, padding=1),
+            nn.BatchNorm2d(c1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c1, c1, 3, padding=1),
+            nn.BatchNorm2d(c1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),
+            nn.Dropout2d(0.1),
 
-    def forward(self, x: torch.Tensor, T: float = 0.1, return_aux=False):  # B × C × H × W
+            nn.Conv2d(c1, c2, 3, padding=1),
+            nn.BatchNorm2d(c2),
+            nn.ReLU(inplace=True),
+            # nn.Conv2d(c2, c2, 3, padding=1),
+            # nn.BatchNorm2d(c2),
+            # nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2),
+            nn.Dropout2d(0.1),
+        )
+
+        # Experts (heads)
+        self.experts = nn.ModuleList([
+            SlimExpert(
+                in_channels,
+                hidden_channels,
+                embed_dim,
+                num_classes,
+                scorer_hidden=scorer_hidden,
+            ) for _ in range(num_experts)
+        ])
+
+        # Loss weights
+        self.scorer_aux_loss_weight = scorer_aux_loss_weight
+        self.orthogonality_weight = orthogonality_weight
+        self.class_entropy_weight = class_entropy_weight
+        self.diversity_weight = diversity_weight
+
+        self._init_weights()  # <-- Add this line to call initialization
+
+    def _init_weights(self):
+        # Initialize shared encoder
+        for m in self.encoder.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.zeros_(m.bias)
+        # Initialize experts
+        for expert in self.experts:
+            for m in expert.modules():
+                if isinstance(m, nn.Conv2d):
+                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+                elif isinstance(m, nn.BatchNorm2d):
+                    nn.init.ones_(m.weight)
+                    nn.init.zeros_(m.bias)
+                elif isinstance(m, nn.Linear):
+                    nn.init.xavier_normal_(m.weight)
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x, T=0.1, return_aux=False, targets=None):
         B = x.size(0)
         device = x.device
-        C = (
-            self._static_capacity
-            if self._static_capacity is not None
-            else math.ceil(B / self.num_experts)
-        )
-        
-        # ---------------------------------------------------------------
-        # 1) Preference scoring (cheap) – all experts, all tokens
-        # ---------------------------------------------------------------
-        with torch.no_grad():
-            scores = torch.stack([
-                expert.score_tokens(x) for expert in self.experts
-            ], dim=1)  # B × E
-        probs = torch.softmax(scores, dim=1)  # B × E (for load‑balance loss)
-        
-        gumbel = -torch.log(-torch.log(torch.rand_like(scores)))   # Gumbel(0,1)
-        scores_noisy = (scores + gumbel) / T                       # T decays → 0
+        C = (self._static_capacity if self._static_capacity is not None else math.ceil(B / self.num_experts))
+        features = self.encoder(x)  # (B, c2, H, W)
+        flat_features = features.mean(dim=(-2, -1))  # (B, c2), for scorer/class
 
-        # ---------------------------------------------------------------
-        # 2) Waterfall routing with capacity‑constraint
-        # ---------------------------------------------------------------
+        # Per-expert scores and class logits
+        scores = torch.stack([expert.score_tokens(flat_features) for expert in self.experts], dim=1)  # (B, E)
+        class_logits = torch.stack([expert.predict_class(flat_features) for expert in self.experts], dim=1)  # (B, E, C)
+        class_probs = torch.softmax(class_logits, dim=2)  # (B, E, C)
+
+        # Routing: bonus for ground-truth class probability
+        if targets is not None and self.training:
+            targets_expand = targets.view(B, 1).expand(B, self.num_experts).to(device)
+            gt_probs = class_probs.gather(2, targets_expand.unsqueeze(-1)).squeeze(-1)
+        else:
+            gt_probs = torch.zeros(B, self.num_experts, device=device)
+
+        beta = 1.0  # Weight for ground-truth bonus
+        scores -= scores.mean(dim=0, keepdim=True)  # Center scores
+        combined_score = scores + beta * gt_probs.clamp_min(1e-9).log()
+
+        # Routing probabilities (for aux loss and logging)
+        probs = torch.softmax(combined_score, dim=1)
+        if self.training: 
+            gumbel = -torch.log(-torch.log(torch.rand_like(scores)))   # Gumbel(0,1)
+            scores_noisy = (combined_score + gumbel) / T                       # T decays → 0
+        else:
+            scores_noisy = combined_score/T
+        # scores_noisy = combined_score / T  # Optionally add Gumbel noise for exploration
+        scores_noisy = scores_noisy.clamp(min=-1e9, max=1e9)  # Avoid NaNs in softmax
+
+        # --- Waterfall Routing ---
         assignment = torch.zeros(B, self.num_experts, dtype=torch.bool, device=device)
         cap = torch.zeros(self.num_experts, dtype=torch.long, device=device)
         remaining = torch.arange(B, device=device)
         iter_ = 0
-        while remaining.numel() > 0:
-            # Copy scores for remaining tokens
-            scores_this = scores_noisy[remaining].clone()  # (|R|, E)
+        if self.training:
+            alpha = 5.0  # Capacity penalty
+        else:
+            alpha = 0.0 
             
-            # Mask out full experts by setting their scores to -inf
-            deficit = (cap.float() / C).clamp(0, 1)  # 0 (empty) ... 1 (full)
-            scores_this = scores_this * (1-deficit)  # penalize full/near-full experts
+        while remaining.numel() > 0 and iter_ < 15:
+            scores_this = scores_noisy[remaining].clone()
+            deficit = (cap.float() / C).clamp(0, 1)
+            scores_this = scores_this - alpha * deficit
+
             full_experts = (cap >= C)
             if full_experts.any():
                 scores_this[:, full_experts] = float('-inf')
-            # Each remaining token chooses its best expert among those with capacity
-            best_exp = scores_this.argmax(dim=1)  # (|R|, E)
+            best_exp = scores_this.argmax(dim=1)
             taken_mask_global = torch.zeros_like(remaining, dtype=torch.bool)
-            
-            quota = 2 ** iter_  # quota doubles each round
-            # MAX_PER_ROUND = 8          # <- new knob
+            quota = 2 ** iter_
             for e in range(self.num_experts):
-                want = (best_exp == e).nonzero(as_tuple=True)[0]      # local indices
-                if want.numel() == 0:
-                    continue
-                space = min(C - cap[e].item(), quota)        # quota
-                if space <= 0:
-                    continue
+                want = (best_exp == e).nonzero(as_tuple=True)[0]
+                if want.numel() == 0: continue
+                space = min(C - cap[e].item(), quota)
+                if space <= 0: continue
                 select = want[:space]
                 token_ids = remaining[select]
                 assignment[token_ids, e] = True
                 cap[e] += select.numel()
                 taken_mask_global[select] = True
-
-            # remove taken tokens for next round
             remaining = remaining[~taken_mask_global]
             iter_ += 1
 
-        unassigned_tokens = remaining.numel()
-        # Safety fallback: still‑unassigned tokens → greedy to least loaded expert
-        if unassigned_tokens > 0:
-            load = cap.float() / C  # frac used
-            least_loaded = load.argmin().item()
+        # Fallback: assign remaining to least-loaded expert
+        if remaining.numel() > 0:
+            least_loaded = (cap.float() / C).argmin().item()
             assignment[remaining, least_loaded] = True
             cap[least_loaded] += remaining.numel()
-            remaining = torch.empty(0, dtype=torch.long, device=device)
 
-        # ---------------------------------------------------------------
-        # 3) Compute per‑expert predictions on *assigned* tokens only
-        # ---------------------------------------------------------------
+        # --- Compute per-expert predictions ---
         out_logits = torch.zeros(B, self.num_classes, device=device)
+        z_expert_outputs = []
         for e, expert in enumerate(self.experts):
             idx = torch.where(assignment[:, e])[0]
-            if idx.numel() == 0:
-                continue  # this expert unused this step
-            logits_e = expert(x[idx])  # forward pass only for its share
-            out_logits[idx] = logits_e.to(out_logits.dtype)
+            if idx.numel() == 0: continue
+            feats = expert.encoder(features[idx])
+            z = expert.project(feats)
+            logits = expert.classifier(z)
+            out_logits[idx] = logits.to(out_logits.dtype)
+            z_expert_outputs.append(z)
 
-        # ---------------------------------------------------------------
-        # 4) Optional load‑balance loss (mean over batch)
-        # ---------------------------------------------------------------
+        
+        # --- Auxiliary losses ---
         aux_loss = None
-        if self.training and self.balance_loss_weight > 0:
-            # Shannon entropy of routing probabilities averaged over batch.
-            entropy = -(probs * probs.clamp_min(1e-9).log()).sum(dim=1).mean()
-            aux_loss = -entropy * self.balance_loss_weight
+        aux_losses = {}
 
-        return (out_logits, probs, assignment, aux_loss, iter_) if return_aux else out_logits
+        # Scorer auxiliary loss (KL)
+        if self.training and self.scorer_aux_loss_weight > 0:
+            scorer_targets = probs
+            scorer_predictions = torch.softmax(scores, dim=1)
+            scorer_loss = F.kl_div(
+                scorer_predictions.log(), scorer_targets, reduction='batchmean'
+            )
+            aux_losses['scorer'] = scorer_loss * self.scorer_aux_loss_weight
 
+        # Orthogonality loss (optional, only if needed)
+        if self.training and self.orthogonality_weight > 0:
+            orth_loss = orthogonality_loss(z_expert_outputs) * self.orthogonality_weight
+            aux_losses['orthogonality'] = orth_loss
 
-# ---------------------------------------------------------------------------
-# Minimal usage demo
-# ---------------------------------------------------------------------------
+        # Class entropy loss (for specialization)
+        if self.training and self.class_entropy_weight > 0:
+            class_entropy = -(class_probs * (class_probs + 1e-9).log()).sum(dim=2).mean()
+            aux_losses['class_entropy'] = class_entropy * self.class_entropy_weight
 
-def _demo():
-    import time
+        # Diversity loss (optional, for encouraging experts to specialize on different classes)
+        if self.training and self.diversity_weight > 0:
+            mean_class_probs = class_probs.mean(dim=0)
+            diversity = 0.0
+            num_pairs = 0
+            for i in range(self.num_experts):
+                for j in range(i + 1, self.num_experts):
+                    pi = mean_class_probs[i].clamp_min(1e-8)
+                    pj = mean_class_probs[j].clamp_min(1e-8)
+                    kl = F.kl_div(pi.log(), pj, reduction='batchmean')
+                    diversity += kl
+                    num_pairs += 1
+            aux_losses['diversity'] = -diversity / max(num_pairs, 1) * self.diversity_weight
 
-    torch.manual_seed(42)
-    model = CollaborativeWaterfallMoE(num_experts=4, num_classes=10).cuda()
-    optim = torch.optim.Adam(model.parameters(), lr=3e-4)
-    criterion = nn.CrossEntropyLoss()
+        aux_loss = sum(aux_losses.values()) if aux_losses else None
 
-    B = 64
-    dummy_x = torch.randn(B, 3, 32, 32).cuda()
-    dummy_y = torch.randint(0, 10, (B,), dtype=torch.long).cuda()
-
-    model.train()
-    for step in range(3):
-        st = time.time()
-        logits, aux_loss, *_ = model(dummy_x, return_aux=True)
-        loss = criterion(logits, dummy_y)
-        if aux_loss is not None:
-            loss = loss + aux_loss
-        optim.zero_grad()
-        loss.backward()
-        optim.step()
-        print(f"step {step}: loss={loss.item():.3f}  (aux={aux_loss.item() if aux_loss is not None else 0:.3f}) | {time.time()-st:.2f}s")
-
-
-if __name__ == "__main__":
-    _demo()
+        if return_aux:
+            return out_logits, probs, assignment, aux_loss, iter_, scores, aux_losses
+        return out_logits
